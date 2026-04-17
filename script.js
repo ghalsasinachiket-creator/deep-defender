@@ -15,38 +15,90 @@ document.getElementById('file-input').addEventListener('change', function(e) {
     }
 });
 
-function processAnalysis(source) {
-    const box = document.getElementById('result-display');
-    const spinner = document.getElementById('spinner');
-    const content = document.getElementById('analysis-content');
+function setResultState({ titleText, color, width, description }) {
     const title = document.getElementById('risk-title');
     const bar = document.getElementById('meter-fill');
     const desc = document.getElementById('risk-desc');
+
+    title.innerText = titleText;
+    title.style.color = color;
+    bar.style.width = width;
+    bar.style.backgroundColor = color;
+    desc.innerText = description;
+}
+
+async function processAnalysis(source) {
+    const box = document.getElementById('result-display');
+    const spinner = document.getElementById('spinner');
+    const content = document.getElementById('analysis-content');
 
     box.classList.remove('hidden');
     spinner.classList.remove('hidden');
     content.classList.add('hidden');
 
-    setTimeout(() => {
+    try {
+        let payload;
+
+        if (source === 'url') {
+            const url = document.getElementById('url-field').value.trim();
+            if (!url) {
+                throw new Error('Enter a URL to analyze.');
+            }
+
+            const response = await fetch('/api/url/analyze', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ url })
+            });
+
+            payload = await response.json();
+            if (!response.ok) {
+                throw new Error(payload.error || 'URL analysis failed.');
+            }
+        } else {
+            const filename = source;
+            const isAudio = /\.(wav|mp3|m4a|ogg|flac)$/i.test(filename);
+            const endpoint = isAudio ? '/api/voice/detect' : '/api/image/detect';
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ filename })
+            });
+
+            payload = await response.json();
+            if (!response.ok) {
+                throw new Error(payload.error || 'File analysis failed.');
+            }
+            payload.reason = isAudio
+                ? `Audio file ${filename} was analyzed by the backend voice pipeline.`
+                : `Image file ${filename} was analyzed by the backend image pipeline.`;
+        }
+
         spinner.classList.add('hidden');
         content.classList.remove('hidden');
+        const isSuspicious = payload.result === 'FAKE';
+        const score = Math.round((payload.risk_score ?? payload.confidence ?? 0.5) * 100);
 
-        const isSuspicious = source.toLowerCase().includes('fake') || source === 'url';
-        
-        if (isSuspicious) {
-            title.innerText = "High Risk Detected";
-            title.style.color = "#ff4d4d";
-            bar.style.width = "85%";
-            bar.style.backgroundColor = "#ff4d4d";
-            desc.innerText = "Our models detected significant markers of AI manipulation in this content.";
-        } else {
-            title.innerText = "Content Authentic";
-            title.style.color = "#00ff88";
-            bar.style.width = "10%";
-            bar.style.backgroundColor = "#00ff88";
-            desc.innerText = "No significant signs of forgery detected. Content matches original patterns.";
-        }
-    }, 2000);
+        setResultState({
+            titleText: isSuspicious ? 'High Risk Detected' : 'Content Authentic',
+            color: isSuspicious ? '#ff4d4d' : '#00ff88',
+            width: `${Math.max(score, 8)}%`,
+            description: payload.reason || 'Analysis completed.'
+        });
+    } catch (error) {
+        spinner.classList.add('hidden');
+        content.classList.remove('hidden');
+        setResultState({
+            titleText: 'Analysis Failed',
+            color: '#ffb347',
+            width: '100%',
+            description: error.message || 'Something went wrong while analyzing this content.'
+        });
+    }
 }
 
 const dropArea = document.getElementById('drop-area');
