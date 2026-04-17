@@ -1,8 +1,6 @@
 import ipaddress
 import os
 import random
-import re
-import sqlite3
 import socket
 import tempfile
 import urllib.error
@@ -10,12 +8,16 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
+
 from flask import Flask, abort, jsonify, request, send_from_directory
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import func
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FRONTEND_FILES = {"index.html", "script.js", "style.css"}
 MAX_HTML_BYTES = 1_000_000
 MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024
+
 SUSPICIOUS_TERMS = {
     "deepfake", "face-swap", "faceswap", "synthetic", "ai-generated",
     "ai_voice", "voice-clone", "voiceclone", "cloned", "fake", "forged"
@@ -26,9 +28,96 @@ AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".flac"}
 app = Flask(__name__)
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
-DB_PATH = os.path.join(BASE_DIR, "detections.db")
+# ─── DATABASE CONFIG ──────────────────────────────────────────────
+database_url = os.getenv("DATABASE_URL", "")
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
+if not database_url:
+    # Local development falls back to the checked-in SQLite database automatically.
+    database_url = f"sqlite:///{os.path.join(BASE_DIR, 'detections.db')}"
+
+app.config["SQLALCHEMY_DATABASE_URI"] = database_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
 
 
+# ─── MODELS ────────────────────────────────────────────────────────
+class ImageDetection(db.Model):
+    __tablename__ = "image_detections"
+
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.Text, nullable=False)
+    result = db.Column(db.Text, nullable=False)  # 'FAKE' or 'REAL'
+    confidence = db.Column(db.Float, nullable=False)  # 0.0 to 1.0
+    model_used = db.Column(db.Text, default="ResNet-50")
+    detected_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "filename": self.filename,
+            "result": self.result,
+            "confidence": self.confidence,
+            "model_used": self.model_used,
+            "detected_at": self.detected_at.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+
+class VoiceDetection(db.Model):
+    __tablename__ = "voice_detections"
+
+    id = db.Column(db.Integer, primary_key=True)
+    filename = db.Column(db.Text, nullable=False)
+    result = db.Column(db.Text, nullable=False)  # 'FAKE' or 'REAL'
+    confidence = db.Column(db.Float, nullable=False)
+    duration_sec = db.Column(db.Float, default=0.0)
+    model_used = db.Column(db.Text, default="WaveNet-Detector")
+    detected_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "filename": self.filename,
+            "result": self.result,
+            "confidence": self.confidence,
+            "duration_sec": self.duration_sec,
+            "model_used": self.model_used,
+            "detected_at": self.detected_at.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+
+class UrlDetection(db.Model):
+    __tablename__ = "url_detections"
+
+    id = db.Column(db.Integer, primary_key=True)
+    source_url = db.Column(db.Text, nullable=False)
+    resolved_url = db.Column(db.Text, nullable=False)
+    media_type = db.Column(db.Text, nullable=False)
+    result = db.Column(db.Text, nullable=False)
+    confidence = db.Column(db.Float, nullable=False)
+    risk_score = db.Column(db.Float, nullable=False)
+    model_used = db.Column(db.Text, nullable=False)
+    reason = db.Column(db.Text, nullable=False)
+    detected_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "source_url": self.source_url,
+            "resolved_url": self.resolved_url,
+            "media_type": self.media_type,
+            "result": self.result,
+            "confidence": self.confidence,
+            "risk_score": self.risk_score,
+            "model_used": self.model_used,
+            "reason": self.reason,
+            "detected_at": self.detected_at.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+
+# ─── URL / MEDIA ANALYSIS HELPERS ──────────────────────────────────
 class MediaLinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -164,6 +253,7 @@ def fetch_remote_media(url, depth=0):
         _, ext = os.path.splitext(path)
         suffix = ext if ext else (".jpg" if media_type == "image" else ".wav")
         tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=BASE_DIR)
+
         try:
             total = 0
             while True:
@@ -191,7 +281,6 @@ def try_load_image_modules():
         import cv2
         import numpy as np
         from image_preprocess import load_and_preprocess_image
-
         return {"cv2": cv2, "np": np, "preprocess": load_and_preprocess_image}
     except Exception:
         return None
@@ -202,7 +291,6 @@ def try_load_audio_modules():
         import librosa
         import numpy as np
         from audio_preprocess import load_and_preprocess_audio
-
         return {"librosa": librosa, "np": np, "preprocess": load_and_preprocess_audio}
     except Exception:
         return None
@@ -350,184 +438,135 @@ def make_detection_payload(source_url, media_type, score, reasons, model_used, r
 
 
 def save_url_detection(payload):
-    conn = get_db()
-    conn.execute(
-        """
-        INSERT INTO url_detections
-            (source_url, resolved_url, media_type, result, confidence, risk_score, model_used, reason, detected_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload["source_url"],
-            payload["resolved_url"],
-            payload["media_type"],
-            payload["result"],
-            payload["confidence"],
-            payload["risk_score"],
-            payload["model_used"],
-            payload["reason"],
-            payload["detected_at"],
-        ),
+    rec = UrlDetection(
+        source_url=payload["source_url"],
+        resolved_url=payload["resolved_url"],
+        media_type=payload["media_type"],
+        result=payload["result"],
+        confidence=payload["confidence"],
+        risk_score=payload["risk_score"],
+        model_used=payload["model_used"],
+        reason=payload["reason"],
+        detected_at=datetime.strptime(payload["detected_at"], "%Y-%m-%d %H:%M:%S"),
     )
-    conn.commit()
-    conn.close()
+    db.session.add(rec)
+    db.session.commit()
 
-# ─── DATABASE SETUP ───────────────────────────────────────────────
+
+# ─── DB INIT + DEMO SEED ──────────────────────────────────────────
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    # Table for image fake detections
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS image_detections (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename     TEXT NOT NULL,
-            result       TEXT NOT NULL,        -- 'FAKE' or 'REAL'
-            confidence   REAL NOT NULL,        -- 0.0 to 1.0
-            model_used   TEXT DEFAULT 'ResNet-50',
-            detected_at  TEXT NOT NULL
-        )
-    """)
-
-    # Table for voice fake detections
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS voice_detections (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            filename     TEXT NOT NULL,
-            result       TEXT NOT NULL,        -- 'FAKE' or 'REAL'
-            confidence   REAL NOT NULL,
-            duration_sec REAL DEFAULT 0.0,     -- audio clip duration
-            model_used   TEXT DEFAULT 'WaveNet-Detector',
-            detected_at  TEXT NOT NULL
-        )
-    """)
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS url_detections (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            source_url   TEXT NOT NULL,
-            resolved_url TEXT NOT NULL,
-            media_type   TEXT NOT NULL,
-            result       TEXT NOT NULL,
-            confidence   REAL NOT NULL,
-            risk_score   REAL NOT NULL,
-            model_used   TEXT NOT NULL,
-            reason       TEXT NOT NULL,
-            detected_at  TEXT NOT NULL
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+    db.create_all()
 
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row   # dict-like row access
-    return conn
-
-
-# ─── SEED SAMPLE DATA (for demo) ─────────────────────────────────
 def seed_demo_data():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM image_detections")
-    if c.fetchone()[0] > 0:
-        conn.close()
-        return  # already seeded
+    if ImageDetection.query.count() > 0:
+        return
 
-    image_files = ["face_001.jpg","photo_scan.png","user_upload.jpg","synthetic_gen.png",
-                   "portrait_ai.jpg","news_img.jpg","social_post.jpg","id_scan.jpg"]
-
-    voice_files = ["audio_clip.wav","voice_msg.mp3","call_record.wav",
-                   "synthetic_voice.wav","deepfake_audio.mp3","real_speech.wav","podcast_seg.mp3",
-                   "phone_call.wav"]
+    image_files = [
+        "face_001.jpg", "photo_scan.png", "user_upload.jpg", "synthetic_gen.png",
+        "portrait_ai.jpg", "news_img.jpg", "social_post.jpg", "id_scan.jpg"
+    ]
+    voice_files = [
+        "audio_clip.wav", "voice_msg.mp3", "call_record.wav", "synthetic_voice.wav",
+        "deepfake_audio.mp3", "real_speech.wav", "podcast_seg.mp3", "phone_call.wav"
+    ]
 
     base = datetime.now() - timedelta(days=7)
+
     for i, f in enumerate(image_files):
         result = "FAKE" if i % 3 != 0 else "REAL"
         conf = round(random.uniform(0.72, 0.99), 2)
-        ts = (base + timedelta(hours=i*8)).strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("INSERT INTO image_detections (filename,result,confidence,detected_at) VALUES (?,?,?,?)",
-                  (f, result, conf, ts))
+        ts = base + timedelta(hours=i * 8)
+        db.session.add(
+            ImageDetection(filename=f, result=result, confidence=conf, detected_at=ts)
+        )
 
     for i, f in enumerate(voice_files):
         result = "FAKE" if i % 4 != 0 else "REAL"
         conf = round(random.uniform(0.68, 0.98), 2)
         dur = round(random.uniform(2.0, 45.0), 1)
-        ts = (base + timedelta(hours=i*9+2)).strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("INSERT INTO voice_detections (filename,result,confidence,duration_sec,detected_at) VALUES (?,?,?,?,?)",
-                  (f, result, conf, dur, ts))
+        ts = base + timedelta(hours=i * 9 + 2)
+        db.session.add(
+            VoiceDetection(
+                filename=f,
+                result=result,
+                confidence=conf,
+                duration_sec=dur,
+                detected_at=ts,
+            )
+        )
 
-    conn.commit()
-    conn.close()
+    db.session.commit()
 
 
-# ─── IMAGE DETECTION ROUTES ───────────────────────────────────────
+# ─── IMAGE ROUTES ─────────────────────────────────────────────────
 @app.route("/api/image/detect", methods=["POST"])
 def image_detect():
-    """Simulate detection and save to DB"""
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     filename = data.get("filename", "unknown.jpg")
-    result = random.choice(["FAKE", "FAKE", "REAL"])       # biased demo
+    result = random.choice(["FAKE", "FAKE", "REAL"])
     confidence = round(random.uniform(0.75, 0.99), 2)
-    detected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    detected_at = datetime.now()
 
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO image_detections (filename,result,confidence,detected_at) VALUES (?,?,?,?)",
-        (filename, result, confidence, detected_at)
+    rec = ImageDetection(
+        filename=filename,
+        result=result,
+        confidence=confidence,
+        detected_at=detected_at
     )
-    conn.commit()
-    conn.close()
+    db.session.add(rec)
+    db.session.commit()
 
-    return jsonify({"result": result, "confidence": confidence,
-                    "filename": filename, "detected_at": detected_at}), 201
+    return jsonify({
+        "result": result,
+        "confidence": confidence,
+        "filename": filename,
+        "detected_at": detected_at.strftime("%Y-%m-%d %H:%M:%S")
+    }), 201
 
 
 @app.route("/api/image/history", methods=["GET"])
 def image_history():
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM image_detections ORDER BY detected_at DESC LIMIT 20"
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in rows])
+    rows = ImageDetection.query.order_by(ImageDetection.detected_at.desc()).limit(20).all()
+    return jsonify([r.to_dict() for r in rows])
 
 
-# ─── VOICE DETECTION ROUTES ───────────────────────────────────────
+# ─── VOICE ROUTES ─────────────────────────────────────────��───────
 @app.route("/api/voice/detect", methods=["POST"])
 def voice_detect():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     filename = data.get("filename", "unknown.wav")
     duration = round(random.uniform(3.0, 30.0), 1)
     result = random.choice(["FAKE", "FAKE", "REAL"])
     confidence = round(random.uniform(0.70, 0.97), 2)
-    detected_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    detected_at = datetime.now()
 
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO voice_detections (filename,result,confidence,duration_sec,detected_at) VALUES (?,?,?,?,?)",
-        (filename, result, confidence, duration, detected_at)
+    rec = VoiceDetection(
+        filename=filename,
+        result=result,
+        confidence=confidence,
+        duration_sec=duration,
+        detected_at=detected_at
     )
-    conn.commit()
-    conn.close()
+    db.session.add(rec)
+    db.session.commit()
 
-    return jsonify({"result": result, "confidence": confidence,
-                    "filename": filename, "duration_sec": duration,
-                    "detected_at": detected_at}), 201
+    return jsonify({
+        "result": result,
+        "confidence": confidence,
+        "filename": filename,
+        "duration_sec": duration,
+        "detected_at": detected_at.strftime("%Y-%m-%d %H:%M:%S")
+    }), 201
 
 
 @app.route("/api/voice/history", methods=["GET"])
 def voice_history():
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM voice_detections ORDER BY detected_at DESC LIMIT 20"
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in rows])
+    rows = VoiceDetection.query.order_by(VoiceDetection.detected_at.desc()).limit(20).all()
+    return jsonify([r.to_dict() for r in rows])
 
 
+# ─── URL ANALYSIS ROUTES ──────────────────────────────────────────
 @app.route("/api/url/analyze", methods=["POST"])
 def url_analyze():
     data = request.get_json(silent=True) or {}
@@ -557,6 +596,7 @@ def url_analyze():
         )
         save_url_detection(payload)
         return jsonify(payload), 200
+
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except urllib.error.URLError as exc:
@@ -567,55 +607,70 @@ def url_analyze():
 
 @app.route("/api/url/history", methods=["GET"])
 def url_history():
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM url_detections ORDER BY detected_at DESC LIMIT 20"
-    ).fetchall()
-    conn.close()
-    return jsonify([dict(r) for r in rows])
+    rows = UrlDetection.query.order_by(UrlDetection.detected_at.desc()).limit(20).all()
+    return jsonify([r.to_dict() for r in rows])
 
 
-# ─── ANALYTICS ROUTE ──────────────────────────────────────────────
+# ─── ANALYTICS ────────────────────────────────────────────────────
 @app.route("/api/analytics", methods=["GET"])
 def analytics():
-    conn = get_db()
-
-    def stats(table):
-        total = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        fake  = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE result='FAKE'").fetchone()[0]
-        real  = total - fake
-        avg_conf = conn.execute(f"SELECT AVG(confidence) FROM {table}").fetchone()[0]
+    def stats(model):
+        total = db.session.query(func.count(model.id)).scalar() or 0
+        fake = db.session.query(func.count(model.id)).filter(model.result == "FAKE").scalar() or 0
+        real = total - fake
+        avg_conf = db.session.query(func.avg(model.confidence)).scalar() or 0.0
         return {
-            "total": total, "fake": fake, "real": real,
+            "total": total,
+            "fake": fake,
+            "real": real,
             "fake_pct": round(fake / total * 100, 1) if total else 0,
             "avg_confidence": round(avg_conf * 100, 1) if avg_conf else 0
         }
 
-    # Daily trend (last 7 days) — image
-    daily_img = conn.execute("""
-        SELECT substr(detected_at,1,10) as day, result, COUNT(*) as cnt
-        FROM image_detections
-        WHERE detected_at >= date('now','-7 days')
-        GROUP BY day, result ORDER BY day
-    """).fetchall()
+    last_7_days = datetime.now() - timedelta(days=7)
 
-    daily_voice = conn.execute("""
-        SELECT substr(detected_at,1,10) as day, result, COUNT(*) as cnt
-        FROM voice_detections
-        WHERE detected_at >= date('now','-7 days')
-        GROUP BY day, result ORDER BY day
-    """).fetchall()
+    daily_img_rows = (
+        db.session.query(
+            func.date(ImageDetection.detected_at).label("day"),
+            ImageDetection.result.label("result"),
+            func.count(ImageDetection.id).label("cnt"),
+        )
+        .filter(ImageDetection.detected_at >= last_7_days)
+        .group_by(func.date(ImageDetection.detected_at), ImageDetection.result)
+        .order_by(func.date(ImageDetection.detected_at))
+        .all()
+    )
 
-    conn.close()
+    daily_voice_rows = (
+        db.session.query(
+            func.date(VoiceDetection.detected_at).label("day"),
+            VoiceDetection.result.label("result"),
+            func.count(VoiceDetection.id).label("cnt"),
+        )
+        .filter(VoiceDetection.detected_at >= last_7_days)
+        .group_by(func.date(VoiceDetection.detected_at), VoiceDetection.result)
+        .order_by(func.date(VoiceDetection.detected_at))
+        .all()
+    )
+
+    daily_image = [
+        {"day": str(r.day), "result": r.result, "cnt": int(r.cnt)}
+        for r in daily_img_rows
+    ]
+    daily_voice = [
+        {"day": str(r.day), "result": r.result, "cnt": int(r.cnt)}
+        for r in daily_voice_rows
+    ]
+
     return jsonify({
-        "image": stats("image_detections"),
-        "voice": stats("voice_detections"),
-        "daily_image": [dict(r) for r in daily_img],
-        "daily_voice": [dict(r) for r in daily_voice]
+        "image": stats(ImageDetection),
+        "voice": stats(VoiceDetection),
+        "daily_image": daily_image,
+        "daily_voice": daily_voice
     })
 
 
-# ─── SERVE FRONTEND ───────────────────────────────────────────────
+# ─── FRONTEND SERVING ─────────────────────────────────────────────
 @app.route("/")
 @app.route("/index.html")
 def index():
@@ -638,12 +693,12 @@ def disable_cache(response):
 
 
 def main():
-    init_db()
-    seed_demo_data()
+    with app.app_context():
+        init_db()
+        seed_demo_data()
     print("DeepDetect running → http://localhost:9000")
     app.run(debug=True, port=9000)
 
 
 if __name__ == "__main__":
     main()
-
